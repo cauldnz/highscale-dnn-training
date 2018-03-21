@@ -1,247 +1,398 @@
-import pandas as pd
+"""Trains a ResNet on the CIFAR10 dataset.
+ResNet v1
+[a] Deep Residual Learning for Image Recognition
+https://arxiv.org/pdf/1512.03385.pdf
+ResNet v2
+[b] Identity Mappings in Deep Residual Networks
+https://arxiv.org/pdf/1603.05027.pdf
+"""
+
+from __future__ import print_function
+import keras
+from keras.layers import Dense, Conv2D, BatchNormalization, Activation
+from keras.layers import AveragePooling2D, Input, Flatten
+from keras.optimizers import Adam
+from keras.callbacks import ModelCheckpoint, LearningRateScheduler
+from keras.callbacks import ReduceLROnPlateau
+from keras.preprocessing.image import ImageDataGenerator
+from keras.regularizers import l2
+from keras import backend as K
+from keras.models import Model
+from keras.datasets import cifar10
 import numpy as np
 import os
-import imageio
 
-from keras.utils import plot_model
-from keras.models import Model
-from keras.layers import Input
-from keras.layers import Dense
-from keras.layers import Flatten
-from keras.layers import Activation
-from keras.layers import Dropout
-from keras.layers import Maximum
-from keras.layers import ZeroPadding2D
-from keras.layers.convolutional import Conv2D
-from keras.layers.pooling import MaxPooling2D
-from keras.layers.merge import concatenate
-from keras import regularizers
-from keras.layers import BatchNormalization
-from keras.optimizers import Adam, SGD
-from keras.preprocessing.image import ImageDataGenerator
-from keras.callbacks import ModelCheckpoint, ReduceLROnPlateau
-from keras.layers.advanced_activations import LeakyReLU
-from keras.utils import to_categorical
-from sklearn.model_selection import train_test_split
-from skimage.transform import resize as imresize
-from tqdm import tqdm
+# Training parameters
+batch_size = 128  # orig paper trained all networks with batch_size=128
+epochs = 200
+data_augmentation = True
+num_classes = 10
+
+# Subtracting pixel mean improves accuracy
+subtract_pixel_mean = True
+
+# Model parameter
+# ----------------------------------------------------------------------------
+#           |      | 200-epoch | Orig Paper| 200-epoch | Orig Paper| sec/epoch
+# Model     |  n   | ResNet v1 | ResNet v1 | ResNet v2 | ResNet v2 | GTX1080Ti
+#           |v1(v2)| %Accuracy | %Accuracy | %Accuracy | %Accuracy | v1 (v2)
+# ----------------------------------------------------------------------------
+# ResNet20  | 3 (2)| 92.16     | 91.25     | -----     | -----     | 35 (---)
+# ResNet32  | 5(NA)| 92.46     | 92.49     | NA        | NA        | 50 ( NA)
+# ResNet44  | 7(NA)| 92.50     | 92.83     | NA        | NA        | 70 ( NA)
+# ResNet56  | 9 (6)| 92.71     | 93.03     | 93.01     | NA        | 90 (100)
+# ResNet110 |18(12)| 92.65     | 93.39+-.16| 93.15     | 93.63     | 165(180)
+# ResNet164 |27(18)| -----     | 94.07     | -----     | 94.54     | ---(---)
+# ResNet1001| (111)| -----     | 92.39     | -----     | 95.08+-.14| ---(---)
+# ---------------------------------------------------------------------------
+n = 18
+
+# Model version
+# Orig paper: version = 1 (ResNet v1), Improved ResNet: version = 2 (ResNet v2)
+version = 2
+
+# Computed depth from supplied model parameter n
+if version == 1:
+    depth = n * 6 + 2
+elif version == 2:
+    depth = n * 9 + 2
+
+# Model name, depth and version
+model_type = 'ResNet%dv%d' % (depth, version)
+
+# Load the CIFAR10 data.
+(x_train, y_train), (x_test, y_test) = cifar10.load_data()
+
+# Input image dimensions.
+input_shape = x_train.shape[1:]
+
+# Normalize data.
+x_train = x_train.astype('float32') / 255
+x_test = x_test.astype('float32') / 255
+
+# If subtract pixel mean is enabled
+if subtract_pixel_mean:
+    x_train_mean = np.mean(x_train, axis=0)
+    x_train -= x_train_mean
+    x_test -= x_train_mean
+
+print('x_train shape:', x_train.shape)
+print(x_train.shape[0], 'train samples')
+print(x_test.shape[0], 'test samples')
+print('y_train shape:', y_train.shape)
+
+# Convert class vectors to binary class matrices.
+y_train = keras.utils.to_categorical(y_train, num_classes)
+y_test = keras.utils.to_categorical(y_test, num_classes)
 
 
-#from subprocess import check_output
-#print(check_output(["ls", "../input"]).decode("utf8"))
+def lr_schedule(epoch):
+    """Learning Rate Schedule
+    Learning rate is scheduled to be reduced after 80, 120, 160, 180 epochs.
+    Called automatically every epoch as part of callbacks during training.
+    # Arguments
+        epoch (int): The number of epochs
+    # Returns
+        lr (float32): learning rate
+    """
+    lr = 1e-3
+    if epoch > 180:
+        lr *= 0.5e-3
+    elif epoch > 160:
+        lr *= 1e-3
+    elif epoch > 120:
+        lr *= 1e-2
+    elif epoch > 80:
+        lr *= 1e-1
+    print('Learning rate: ', lr)
+    return lr
 
 
-BATCH_SIZE = 16
-EPOCHS = 30
-RANDOM_STATE = 11
+def resnet_layer(inputs,
+                 num_filters=16,
+                 kernel_size=3,
+                 strides=1,
+                 activation='relu',
+                 batch_normalization=True,
+                 conv_first=True):
+    """2D Convolution-Batch Normalization-Activation stack builder
+    # Arguments
+        inputs (tensor): input tensor from input image or previous layer
+        num_filters (int): Conv2D number of filters
+        kernel_size (int): Conv2D square kernel dimensions
+        strides (int): Conv2D square stride dimensions
+        activation (string): activation name
+        batch_normalization (bool): whether to include batch normalization
+        conv_first (bool): conv-bn-activation (True) or
+            activation-bn-conv (False)
+    # Returns
+        x (tensor): tensor as input to the next layer
+    """
+    conv = Conv2D(num_filters,
+                  kernel_size=kernel_size,
+                  strides=strides,
+                  padding='same',
+                  kernel_initializer='he_normal',
+                  kernel_regularizer=l2(1e-4))
 
-CLASS = {
-    'Black-grass': 0,
-    'Charlock': 1,
-    'Cleavers': 2,
-    'Common Chickweed': 3,
-    'Common wheat': 4,
-    'Fat Hen': 5,
-    'Loose Silky-bent': 6,
-    'Maize': 7,
-    'Scentless Mayweed': 8,
-    'Shepherds Purse': 9,
-    'Small-flowered Cranesbill': 10,
-    'Sugar beet': 11
-}
-
-INV_CLASS = {
-    0: 'Black-grass',
-    1: 'Charlock',
-    2: 'Cleavers',
-    3: 'Common Chickweed',
-    4: 'Common wheat',
-    5: 'Fat Hen',
-    6: 'Loose Silky-bent',
-    7: 'Maize',
-    8: 'Scentless Mayweed',
-    9: 'Shepherds Purse',
-    10: 'Small-flowered Cranesbill',
-    11: 'Sugar beet'
-}
-
-# Dense layers set
-def dense_set(inp_layer, n, activation, drop_rate=0.):
-    dp = Dropout(drop_rate)(inp_layer)
-    dns = Dense(n)(dp)
-    bn = BatchNormalization(axis=-1)(dns)
-    act = Activation(activation=activation)(bn)
-    return act
-
-# Conv. layers set
-def conv_layer(feature_batch, feature_map, kernel_size=(3, 3),strides=(1,1), zp_flag=False):
-    if zp_flag:
-        zp = ZeroPadding2D((1,1))(feature_batch)
+    x = inputs
+    if conv_first:
+        x = conv(x)
+        if batch_normalization:
+            x = BatchNormalization()(x)
+        if activation is not None:
+            x = Activation(activation)(x)
     else:
-        zp = feature_batch
-    conv = Conv2D(filters=feature_map, kernel_size=kernel_size, strides=strides)(zp)
-    bn = BatchNormalization(axis=3)(conv)
-    act = LeakyReLU(1/10)(bn)
-    return act
+        if batch_normalization:
+            x = BatchNormalization()(x)
+        if activation is not None:
+            x = Activation(activation)(x)
+        x = conv(x)
+    return x
 
-# simple model 
-def get_model():
-    inp_img = Input(shape=(51, 51, 3))
 
-    # 51
-    conv1 = conv_layer(inp_img, 64, zp_flag=False)
-    conv2 = conv_layer(conv1, 64, zp_flag=False)
-    mp1 = MaxPooling2D(pool_size=(3, 3), strides=(2, 2))(conv2)
-    # 23
-    conv3 = conv_layer(mp1, 128, zp_flag=False)
-    conv4 = conv_layer(conv3, 128, zp_flag=False)
-    mp2 = MaxPooling2D(pool_size=(3, 3), strides=(2, 2))(conv4)
-    # 9
-    conv7 = conv_layer(mp2, 256, zp_flag=False)
-    conv8 = conv_layer(conv7, 256, zp_flag=False)
-    conv9 = conv_layer(conv8, 256, zp_flag=False)
-    mp3 = MaxPooling2D(pool_size=(3, 3), strides=(2, 2))(conv9)
-    # 1
-    # dense layers
-    flt = Flatten()(mp3)
-    ds1 = dense_set(flt, 128, activation='tanh')
-    out = dense_set(ds1, 12, activation='softmax')
+def resnet_v1(input_shape, depth, num_classes=10):
+    """ResNet Version 1 Model builder [a]
+    Stacks of 2 x (3 x 3) Conv2D-BN-ReLU
+    Last ReLU is after the shortcut connection.
+    At the beginning of each stage, the feature map size is halved (downsampled)
+    by a convolutional layer with strides=2, while the number of filters is
+    doubled. Within each stage, the layers have the same number filters and the
+    same number of filters.
+    Features maps sizes:
+    stage 0: 32x32, 16
+    stage 1: 16x16, 32
+    stage 2:  8x8,  64
+    The Number of parameters is approx the same as Table 6 of [a]:
+    ResNet20 0.27M
+    ResNet32 0.46M
+    ResNet44 0.66M
+    ResNet56 0.85M
+    ResNet110 1.7M
+    # Arguments
+        input_shape (tensor): shape of input image tensor
+        depth (int): number of core convolutional layers
+        num_classes (int): number of classes (CIFAR10 has 10)
+    # Returns
+        model (Model): Keras model instance
+    """
+    if (depth - 2) % 6 != 0:
+        raise ValueError('depth should be 6n+2 (eg 20, 32, 44 in [a])')
+    # Start model definition.
+    num_filters = 16
+    num_res_blocks = int((depth - 2) / 6)
 
-    model = Model(inputs=inp_img, outputs=out)
-    
-    # The first 50 epochs are used by Adam opt.
-    # Then 30 epochs are used by SGD opt.
-    
-    #mypotim = Adam(lr=2 * 1e-3, beta_1=0.9, beta_2=0.999, epsilon=1e-08)
-    mypotim = SGD(lr=1 * 1e-1, momentum=0.9, nesterov=True)
-    model.compile(loss='categorical_crossentropy',
-                   optimizer=mypotim,
-                   metrics=['accuracy'])
-    model.summary()
+    inputs = Input(shape=input_shape)
+    x = resnet_layer(inputs=inputs)
+    # Instantiate the stack of residual units
+    for stack in range(3):
+        for res_block in range(num_res_blocks):
+            strides = 1
+            if stack > 0 and res_block == 0:  # first layer but not first stack
+                strides = 2  # downsample
+            y = resnet_layer(inputs=x,
+                             num_filters=num_filters,
+                             strides=strides)
+            y = resnet_layer(inputs=y,
+                             num_filters=num_filters,
+                             activation=None)
+            if stack > 0 and res_block == 0:  # first layer but not first stack
+                # linear projection residual shortcut connection to match
+                # changed dims
+                x = resnet_layer(inputs=x,
+                                 num_filters=num_filters,
+                                 kernel_size=1,
+                                 strides=strides,
+                                 activation=None,
+                                 batch_normalization=False)
+            x = keras.layers.add([x, y])
+            x = Activation('relu')(x)
+        num_filters *= 2
+
+    # Add classifier on top.
+    # v1 does not use BN after last shortcut connection-ReLU
+    x = AveragePooling2D(pool_size=8)(x)
+    y = Flatten()(x)
+    outputs = Dense(num_classes,
+                    activation='softmax',
+                    kernel_initializer='he_normal')(y)
+
+    # Instantiate model.
+    model = Model(inputs=inputs, outputs=outputs)
     return model
 
 
-def get_callbacks(filepath, patience=5):
-    lr_reduce = ReduceLROnPlateau(monitor='val_acc', factor=0.1, epsilon=1e-5, patience=patience, verbose=1)
-    msave = ModelCheckpoint(filepath, save_best_only=True)
-    return [lr_reduce, msave]
+def resnet_v2(input_shape, depth, num_classes=10):
+    """ResNet Version 2 Model builder [b]
+    Stacks of (1 x 1)-(3 x 3)-(1 x 1) BN-ReLU-Conv2D or also known as
+    bottleneck layer
+    First shortcut connection per layer is 1 x 1 Conv2D.
+    Second and onwards shortcut connection is identity.
+    At the beginning of each stage, the feature map size is halved (downsampled)
+    by a convolutional layer with strides=2, while the number of filter maps is
+    doubled. Within each stage, the layers have the same number filters and the
+    same filter map sizes.
+    Features maps sizes:
+    conv1  : 32x32,  16
+    stage 0: 32x32,  64
+    stage 1: 16x16, 128
+    stage 2:  8x8,  256
+    # Arguments
+        input_shape (tensor): shape of input image tensor
+        depth (int): number of core convolutional layers
+        num_classes (int): number of classes (CIFAR10 has 10)
+    # Returns
+        model (Model): Keras model instance
+    """
+    if (depth - 2) % 9 != 0:
+        raise ValueError('depth should be 9n+2 (eg 56 or 110 in [b])')
+    # Start model definition.
+    num_filters_in = 16
+    num_res_blocks = int((depth - 2) / 9)
 
-# I trained model about 12h on GTX 950.
-def train_model(img, target):
-    callbacks = get_callbacks(filepath='model_weight_SGD.hdf5', patience=6)
-    gmodel = get_model()
-    gmodel.load_weights(filepath='model_weight_Adam.hdf5')
-    x_train, x_valid, y_train, y_valid = train_test_split(
-                                                        img,
-                                                        target,
-                                                        shuffle=True,
-                                                        train_size=0.8,
-                                                        random_state=RANDOM_STATE
-                                                        )
-    gen = ImageDataGenerator(
-            rotation_range=360.,
-            width_shift_range=0.3,
-            height_shift_range=0.3,
-            zoom_range=0.3,
-            horizontal_flip=True,
-            vertical_flip=True
-    )
-    gmodel.fit_generator(gen.flow(x_train, y_train,batch_size=BATCH_SIZE),
-               steps_per_epoch=10*len(x_train)/BATCH_SIZE,
-               epochs=EPOCHS,
-               verbose=1,
-               shuffle=True,
-               validation_data=(x_valid, y_valid),
-               callbacks=callbacks)
+    inputs = Input(shape=input_shape)
+    # v2 performs Conv2D with BN-ReLU on input before splitting into 2 paths
+    x = resnet_layer(inputs=inputs,
+                     num_filters=num_filters_in,
+                     conv_first=True)
 
-def test_model(img, label):
-    gmodel = get_model()
-    gmodel.load_weights(filepath='../input/plant-weight/model_weight_SGD.hdf5')
-    prob = gmodel.predict(img, verbose=1)
-    pred = prob.argmax(axis=-1)
-    sub = pd.DataFrame({"file": label,
-                         "species": [INV_CLASS[p] for p in pred]})
-    sub.to_csv("sub.csv", index=False, header=True)
+    # Instantiate the stack of residual units
+    for stage in range(3):
+        for res_block in range(num_res_blocks):
+            activation = 'relu'
+            batch_normalization = True
+            strides = 1
+            if stage == 0:
+                num_filters_out = num_filters_in * 4
+                if res_block == 0:  # first layer and first stage
+                    activation = None
+                    batch_normalization = False
+            else:
+                num_filters_out = num_filters_in * 2
+                if res_block == 0:  # first layer but not first stage
+                    strides = 2    # downsample
 
-# Resize all image to 51x51 
-def img_reshape(img):
-    img = imresize(img, (51, 51, 3))
-    return img
+            # bottleneck residual unit
+            y = resnet_layer(inputs=x,
+                             num_filters=num_filters_in,
+                             kernel_size=1,
+                             strides=strides,
+                             activation=activation,
+                             batch_normalization=batch_normalization,
+                             conv_first=False)
+            y = resnet_layer(inputs=y,
+                             num_filters=num_filters_in,
+                             conv_first=False)
+            y = resnet_layer(inputs=y,
+                             num_filters=num_filters_out,
+                             kernel_size=1,
+                             conv_first=False)
+            if res_block == 0:
+                # linear projection residual shortcut connection to match
+                # changed dims
+                x = resnet_layer(inputs=x,
+                                 num_filters=num_filters_out,
+                                 kernel_size=1,
+                                 strides=strides,
+                                 activation=None,
+                                 batch_normalization=False)
+            x = keras.layers.add([x, y])
 
-# get image tag
-def img_label(path):
-    return str(str(path.split('/')[-1]))
+        num_filters_in = num_filters_out
 
-# get plant class on image
-def img_class(path):
-    return str(path.split('/')[-2])
+    # Add classifier on top.
+    # v2 has BN-ReLU before Pooling
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
+    x = AveragePooling2D(pool_size=8)(x)
+    y = Flatten()(x)
+    outputs = Dense(num_classes,
+                    activation='softmax',
+                    kernel_initializer='he_normal')(y)
 
-# fill train and test dict
-def fill_dict(paths, some_dict):
-    text = ''
-    if 'train' in paths[0]:
-        text = 'Start fill train_dict'
-    elif 'test' in paths[0]:
-        text = 'Start fill test_dict'
+    # Instantiate model.
+    model = Model(inputs=inputs, outputs=outputs)
+    return model
 
-    for p in tqdm(paths, ascii=True, ncols=85, desc=text):
-        img = imageio.imread(p)
-        img = img_reshape(img)
-        some_dict['image'].append(img)
-        some_dict['label'].append(img_label(p))
-        if 'train' in paths[0]:
-            some_dict['class'].append(img_class(p))
 
-    return some_dict
+if version == 2:
+    model = resnet_v2(input_shape=input_shape, depth=depth)
+else:
+    model = resnet_v1(input_shape=input_shape, depth=depth)
 
-# read image from dir. and fill train and test dict
-def reader():
-    file_ext = []
-    train_path = []
-    test_path = []
+model.compile(loss='categorical_crossentropy',
+              optimizer=Adam(lr=lr_schedule(0)),
+              metrics=['accuracy'])
+model.summary()
+print(model_type)
 
-    for root, dirs, files in os.walk('../input'):
-        if dirs != []:
-            print('Root:\n'+str(root))
-            print('Dirs:\n'+str(dirs))
-        else:
-            for f in files:
-                ext = os.path.splitext(str(f))[1][1:]
+# Prepare model model saving directory.
+save_dir = os.path.join(os.getcwd(), 'saved_models')
+model_name = 'cifar10_%s_model.{epoch:03d}.h5' % model_type
+if not os.path.isdir(save_dir):
+    os.makedirs(save_dir)
+filepath = os.path.join(save_dir, model_name)
 
-                if ext not in file_ext:
-                    file_ext.append(ext)
+# Prepare callbacks for model saving and for learning rate adjustment.
+checkpoint = ModelCheckpoint(filepath=filepath,
+                             monitor='val_acc',
+                             verbose=1,
+                             save_best_only=True)
 
-                if 'train' in root:
-                    path = os.path.join(root, f)
-                    train_path.append(path)
-                elif 'test' in root:
-                    path = os.path.join(root, f)
-                    test_path.append(path)
-    train_dict = {
-        'image': [],
-        'label': [],
-        'class': []
-    }
-    test_dict = {
-        'image': [],
-        'label': []
-    }
+lr_scheduler = LearningRateScheduler(lr_schedule)
 
-    #train_dict = fill_dict(train_path, train_dict)
-    test_dict = fill_dict(test_path, test_dict)
-    return train_dict, test_dict
-# I commented out some of the code for learning the model.
-def main():
-    train_dict, test_dict = reader()
-    #X_train = np.array(train_dict['image'])
-    #y_train = to_categorical(np.array([CLASS[l] for l in train_dict['class']]))
+lr_reducer = ReduceLROnPlateau(factor=np.sqrt(0.1),
+                               cooldown=0,
+                               patience=5,
+                               min_lr=0.5e-6)
 
-    X_test = np.array(test_dict['image'])
-    label = test_dict['label']
-    
-    # I do not recommend trying to train the model on a kaggle.
-    #train_model(X_train, y_train)
-    test_model(X_test, label)
+callbacks = [checkpoint, lr_reducer, lr_scheduler]
 
-if __name__=='__main__':
-    main()
+# Run training, with or without data augmentation.
+if not data_augmentation:
+    print('Not using data augmentation.')
+    model.fit(x_train, y_train,
+              batch_size=batch_size,
+              epochs=epochs,
+              validation_data=(x_test, y_test),
+              shuffle=True,
+              callbacks=callbacks)
+else:
+    print('Using real-time data augmentation.')
+    # This will do preprocessing and realtime data augmentation:
+    datagen = ImageDataGenerator(
+        # set input mean to 0 over the dataset
+        featurewise_center=False,
+        # set each sample mean to 0
+        samplewise_center=False,
+        # divide inputs by std of dataset
+        featurewise_std_normalization=False,
+        # divide each input by its std
+        samplewise_std_normalization=False,
+        # apply ZCA whitening
+        zca_whitening=False,
+        # randomly rotate images in the range (deg 0 to 180)
+        rotation_range=0,
+        # randomly shift images horizontally
+        width_shift_range=0.1,
+        # randomly shift images vertically
+        height_shift_range=0.1,
+        # randomly flip images
+        horizontal_flip=True,
+        # randomly flip images
+        vertical_flip=False)
+
+    # Compute quantities required for featurewise normalization
+    # (std, mean, and principal components if ZCA whitening is applied).
+    datagen.fit(x_train)
+
+    # Fit the model on the batches generated by datagen.flow().
+    model.fit_generator(datagen.flow(x_train, y_train, batch_size=batch_size),
+                        validation_data=(x_test, y_test),
+                        epochs=epochs, verbose=1, workers=4,
+                        callbacks=callbacks)
+
+# Score trained model.
+scores = model.evaluate(x_test, y_test, verbose=1)
+print('Test loss:', scores[0])
+print('Test accuracy:', scores[1])
